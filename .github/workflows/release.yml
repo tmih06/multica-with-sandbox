@@ -464,6 +464,9 @@ jobs:
         # electron-builder's publish fields for feed detection, so it is
         # rewritten here. The replacement is a no-op on the canonical
         # repository, whose value already matches.
+        # `shell: bash` is required: this matrix runs on windows-latest too,
+        # where the default shell is PowerShell and `sed` does not exist.
+        shell: bash
         env:
           REPO_SLUG: ${{ github.repository }}
         run: |
