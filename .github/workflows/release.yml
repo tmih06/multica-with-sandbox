@@ -481,10 +481,41 @@ jobs:
         # shell is PowerShell and the parameter expansion below is not valid.
         shell: bash
         run: |
-          # electron-builder.yml pins the upstream owner/repo, so the upload
-          # target is overridden per release from GITHUB_REPOSITORY.
-          owner="${GITHUB_REPOSITORY%%/*}"
-          name="${GITHUB_REPOSITORY#*/}"
-          node scripts/package.mjs "--${TARGET}" --x64 --arm64 --publish always \
-            -c.publish.owner="$owner" \
-            -c.publish.repo="$name"
+          # Build only here; the upload is a separate awaited step.
+          #
+          # electron-builder's own publisher writes its release artifacts
+          # asynchronously and the process returns before they finish: a run
+          # that logged every "uploading" line still exited with the release
+          # untouched, because the Node event loop drained at ~8s while the
+          # last asset's upload was still in flight. An explicit `gh release
+          # upload` blocks until the transfer completes and reports a
+          # non-zero status on failure, which is what a release job needs.
+          node scripts/package.mjs "--${TARGET}" --x64 --arm64 --publish never
+
+      - name: Upload Desktop installers (${{ matrix.target }})
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          shopt -s nullglob
+          # A multi-arch run writes each target into its own scoped output
+          # directory (dist/linux-x64, dist/linux-arm64, ...), so these globs
+          # have to span one level. Autoupdate manifests are the `latest*.yml`
+          # files; builder-debug.yml and builder-effective-config.yaml describe
+          # the local build and must not ship.
+          assets=(
+            apps/desktop/dist/*/*.AppImage
+            apps/desktop/dist/*/*.deb
+            apps/desktop/dist/*/*.rpm
+            apps/desktop/dist/*/*.exe
+            apps/desktop/dist/*/*.blockmap
+            apps/desktop/dist/*/latest*.yml
+          )
+          if [ ${#assets[@]} -eq 0 ]; then
+            echo "::error::no Desktop installers were produced"
+            exit 1
+          fi
+          printf 'uploading %s\n' "${assets[@]}"
+          # --clobber makes a same-tag rerun replace assets instead of failing.
+          gh release upload "$tag" "${assets[@]}" --clobber --repo "$GITHUB_REPOSITORY"
