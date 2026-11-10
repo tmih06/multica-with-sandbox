@@ -19,6 +19,10 @@ builds:
       - -X main.commit={{.ShortCommit}}
       - -X main.buildCommit={{.FullCommit}}
       - -X main.date={{.Date}}
+      # Bake in the repository these artifacts publish to, so the shipped CLI
+      # updates from this repo's releases. Empty (snapshot builds) leaves the
+      # upstream default from internal/cli/update.go in place.
+      - -X github.com/multica-ai/multica/server/internal/cli.defaultReleaseRepo={{ if index .Env "MULTICA_RELEASE_REPO" }}{{ .Env.MULTICA_RELEASE_REPO }}{{ end }}
     env:
       - CGO_ENABLED=0
     goos:
@@ -75,13 +79,21 @@ brews:
   - name: multica
     ids:
       - versioned
+    # RELEASE_HOMEBREW_ENABLED is set by the release workflow: "true" when the
+    # tap token exists (the canonical repository), "false" on a fork, which has
+    # no token and no tap. Compare the string explicitly — a Go template treats
+    # the non-empty string "false" as truthy. A skipped upload still builds the
+    # formula into dist/, so a fork release succeeds without touching the tap.
+    skip_upload: "{{ if eq (index .Env \"RELEASE_HOMEBREW_ENABLED\") \"true\" }}false{{ else }}true{{ end }}"
     repository:
-      owner: multica-ai
-      name: homebrew-tap
+      # Templates in the tap owner let a fork point at its own tap without
+      # editing this file; both default to upstream.
+      owner: "{{ if index .Env \"BREW_TAP_OWNER\" }}{{ .Env.BREW_TAP_OWNER }}{{ else }}multica-ai{{ end }}"
+      name: "{{ if index .Env \"BREW_TAP_REPO\" }}{{ .Env.BREW_TAP_REPO }}{{ else }}homebrew-tap{{ end }}"
       branch: main
       token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
     directory: Formula
-    homepage: "https://github.com/multica-ai/multica"
+    homepage: "https://github.com/{{ if index .Env \"MULTICA_RELEASE_REPO\" }}{{ .Env.MULTICA_RELEASE_REPO }}{{ else }}multica-ai/multica{{ end }}"
     description: "Multica CLI — local agent runtime and management tool for the Multica platform"
     # No license stanza: Multica ships under the Multica License (Apache 2.0
     # terms with additional conditions, see LICENSE), which has no SPDX
