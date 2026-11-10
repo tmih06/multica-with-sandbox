@@ -459,20 +459,6 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Point Desktop at this repository
-        # apps/desktop/package.json's repository.url takes precedence over
-        # electron-builder's publish fields for feed detection, so it is
-        # rewritten here. The replacement is a no-op on the canonical
-        # repository, whose value already matches.
-        # `shell: bash` is required: this matrix runs on windows-latest too,
-        # where the default shell is PowerShell and `sed` does not exist.
-        shell: bash
-        env:
-          REPO_SLUG: ${{ github.repository }}
-        run: |
-          sed -i -E "s#\"url\": \"https://github.com/[^\"]+\"#\"url\": \"https://github.com/${REPO_SLUG}.git\"#" apps/desktop/package.json
-          grep -n 'github.com' apps/desktop/package.json
-
       - name: Package Desktop installers (${{ matrix.target }})
         working-directory: apps/desktop
         env:
@@ -491,6 +477,9 @@ jobs:
           # repository's artifacts rather than upstream's.
           MULTICA_RELEASE_REPO: ${{ github.repository }}
           TARGET: ${{ matrix.target }}
+        # Required: this matrix also runs on windows-latest, where the default
+        # shell is PowerShell and the parameter expansion below is not valid.
+        shell: bash
         run: |
           # electron-builder.yml pins the upstream owner/repo, so the upload
           # target is overridden per release from GITHUB_REPOSITORY.
