@@ -14,8 +14,30 @@ import { selectPlatformReleaseAssetName } from "./cli-release-asset";
 // same-repo builds, but it can also repair or bootstrap a managed copy in
 // userData on first launch when the bundled binary is missing or unusable.
 
-const GITHUB_LATEST_BASE =
-  "https://github.com/multica-ai/multica/releases/latest/download";
+// Matches the Go CLI's MULTICA_RELEASE_REPO so a fork's desktop build
+// downloads its own CLI artifacts instead of upstream's. The value is baked in
+// at build time (see electron.vite.config.ts); a runtime env var still wins,
+// which keeps dev and test harnesses able to repoint it.
+declare const __MULTICA_RELEASE_REPO__: string | undefined;
+
+const DEFAULT_RELEASE_REPO = "multica-ai/multica";
+
+function releaseRepoSlug(): string {
+  const configured = (
+    process.env.MULTICA_RELEASE_REPO ??
+    (typeof __MULTICA_RELEASE_REPO__ === "string" ? __MULTICA_RELEASE_REPO__ : "")
+  )
+    .trim()
+    .replace(/^\/+|\/+$/g, "");
+  if (!configured) return DEFAULT_RELEASE_REPO;
+  const parts = configured.split("/");
+  if (parts.length !== 2 || !parts[0] || !parts[1]) return DEFAULT_RELEASE_REPO;
+  return configured;
+}
+
+function githubLatestBase(): string {
+  return `https://github.com/${releaseRepoSlug()}/releases/latest/download`;
+}
 
 function binaryName(): string {
   return process.platform === "win32" ? "multica.exe" : "multica";
@@ -45,7 +67,7 @@ async function downloadToFile(url: string, dest: string): Promise<void> {
 // Fetch goreleaser's published checksums.txt and parse it into a
 // filename → sha256 lookup. Format is `<hex>  <filename>` per line.
 async function fetchChecksums(): Promise<Map<string, string>> {
-  const url = `${GITHUB_LATEST_BASE}/checksums.txt`;
+  const url = `${githubLatestBase()}/checksums.txt`;
   const res = await fetch(url, { redirect: "follow" });
   if (!res.ok) {
     throw new Error(
@@ -100,7 +122,7 @@ async function installFresh(): Promise<string> {
       `no checksum for ${assetName} in checksums.txt — refusing to install unverified binary`,
     );
   }
-  const url = `${GITHUB_LATEST_BASE}/${assetName}`;
+  const url = `${githubLatestBase()}/${assetName}`;
 
   const workDir = join(tmpdir(), `multica-cli-${Date.now()}`);
   await mkdir(workDir, { recursive: true });
