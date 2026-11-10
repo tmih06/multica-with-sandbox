@@ -84,13 +84,16 @@ if [ "$mode" = "build" ]; then
   echo "Built images locally via docker-compose.selfhost.build.yml."
   echo "Local tags: multica-backend:dev and multica-web:dev."
 else
-  echo "Images: ${MULTICA_BACKEND_IMAGE:-ghcr.io/multica-ai/multica-backend}:${MULTICA_IMAGE_TAG:-latest}"
-  echo "        ${MULTICA_WEB_IMAGE:-ghcr.io/multica-ai/multica-web}:${MULTICA_IMAGE_TAG:-latest}"
+  # Fall back to the release repository's owner namespace, matching
+  # docker-compose.selfhost.yml's resolved defaults instead of assuming upstream.
+  image_owner=$(printf '%s' "${MULTICA_RELEASE_REPO:-multica-ai/multica}" | cut -d/ -f1)
+  echo "Images: ${MULTICA_BACKEND_IMAGE:-ghcr.io/${image_owner}/multica-backend}:${MULTICA_IMAGE_TAG:-latest}"
+  echo "        ${MULTICA_WEB_IMAGE:-ghcr.io/${image_owner}/multica-web}:${MULTICA_IMAGE_TAG:-latest}"
 fi
 echo ""
 echo "Log in: configure RESEND_API_KEY in .env for email codes,"
 echo "        or read the generated code from backend logs when Resend is unset."
 echo ""
 echo "Next — install the CLI and connect your machine:"
-echo "  brew install multica-ai/tap/multica"
+echo "  brew install ${MULTICA_BREW_PACKAGE:-multica-ai/tap/multica}"
 echo "  multica setup self-host"
