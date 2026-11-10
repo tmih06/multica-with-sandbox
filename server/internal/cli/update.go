@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/multica-ai/multica/server/internal/selfexec"
 )
@@ -39,6 +40,20 @@ const defaultReleaseAPIBaseURL = "https://api.github.com"
 const releaseAPIBaseURLEnv = "MULTICA_RELEASE_API_BASE_URL"
 const releaseDownloadBaseURLEnv = "MULTICA_RELEASE_DOWNLOAD_BASE_URL"
 
+// MULTICA_RELEASE_REPO names the `owner/name` repository whose GitHub
+// Releases this binary installs from, so a build published from a fork
+// updates from that fork instead of the upstream project. Unset keeps the
+// upstream default; release builds of a fork set it at compile time through
+// defaultReleaseRepo below.
+const releaseRepoEnv = "MULTICA_RELEASE_REPO"
+
+// upstreamReleaseRepo is the immutable fallback. defaultReleaseRepo is a var so
+// release builds can stamp their own slug with -X; because that stamp can be
+// empty (snapshot builds), releaseRepo() validates it and falls back here.
+const upstreamReleaseRepo = "multica-ai/multica"
+
+var defaultReleaseRepo = upstreamReleaseRepo
+
 const DefaultUpdateDownloadTimeout = 120 * time.Second
 
 func releaseAPIBaseURL() string {
@@ -50,6 +65,30 @@ func releaseAPIBaseURL() string {
 
 func releaseDownloadBaseURL() string {
 	return strings.TrimRight(strings.TrimSpace(os.Getenv(releaseDownloadBaseURLEnv)), "/")
+}
+
+// releaseRepo returns the `owner/name` slug the release API and artifact URLs
+// are built for. Invalid values fall back to the build-time default so a typo
+// cannot silently point updates at an unrelated repository.
+func releaseRepo() string {
+	value := strings.Trim(strings.TrimSpace(os.Getenv(releaseRepoEnv)), "/")
+	if value != "" && isRepoSlug(value) {
+		return value
+	}
+	if stamped := strings.Trim(strings.TrimSpace(defaultReleaseRepo), "/"); stamped != "" && isRepoSlug(stamped) {
+		return stamped
+	}
+	return upstreamReleaseRepo
+}
+
+// isRepoSlug reports whether value looks like GitHub's `owner/name` form:
+// exactly one slash, non-empty sides, and no whitespace.
+func isRepoSlug(value string) bool {
+	owner, name, found := strings.Cut(value, "/")
+	if !found || owner == "" || name == "" || strings.Contains(name, "/") {
+		return false
+	}
+	return !strings.ContainsFunc(value, unicode.IsSpace)
 }
 
 func releaseAssetDownloadURL(assetName, targetVersion, fallback string) string {
@@ -254,7 +293,7 @@ func verifyAssetSHA256(data []byte, expectedHex, assetName string) error {
 
 func fetchReleaseByTag(tag string) (*GitHubRelease, error) {
 	client := &http.Client{Timeout: 10 * time.Second}
-	req, err := http.NewRequest(http.MethodGet, releaseAPIBaseURL()+"/repos/multica-ai/multica/releases/tags/"+url.PathEscape(tag), nil)
+	req, err := http.NewRequest(http.MethodGet, releaseAPIBaseURL()+"/repos/"+releaseRepo()+"/releases/tags/"+url.PathEscape(tag), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -277,10 +316,11 @@ func fetchReleaseByTag(tag string) (*GitHubRelease, error) {
 	return &release, nil
 }
 
-// FetchLatestRelease fetches the latest release tag from the multica GitHub repo.
+// FetchLatestRelease fetches the latest release tag from the configured
+// repository (the build-time default, or MULTICA_RELEASE_REPO).
 func FetchLatestRelease() (*GitHubRelease, error) {
 	client := &http.Client{Timeout: 10 * time.Second}
-	req, err := http.NewRequest(http.MethodGet, releaseAPIBaseURL()+"/repos/multica-ai/multica/releases/latest", nil)
+	req, err := http.NewRequest(http.MethodGet, releaseAPIBaseURL()+"/repos/"+releaseRepo()+"/releases/latest", nil)
 	if err != nil {
 		return nil, err
 	}
