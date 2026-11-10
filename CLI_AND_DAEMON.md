@@ -49,6 +49,14 @@ The metadata mirror must serve `/repos/multica-ai/multica/releases/latest` and
 `/<tag>/<asset-name>` and preserve the published `checksums.txt` contents.
 When these variables are unset, the GitHub defaults remain unchanged.
 
+`MULTICA_RELEASE_REPO` (an `owner/name` slug) picks which repository's GitHub
+Releases `multica update` and the daemon's auto-updater poll. Release builds
+stamp the repository they were published from, so a fork's CLI follows that
+fork; setting the variable at runtime overrides the stamped value, and a
+malformed slug falls back to the stamped repository rather than to an
+unrelated one. A build published from a fork therefore never silently upgrades
+itself onto upstream's release.
+
 ## Quick Start
 
 ```bash
