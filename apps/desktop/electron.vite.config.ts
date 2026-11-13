@@ -5,6 +5,16 @@ import tailwindcss from "@tailwindcss/vite";
 
 export default defineConfig({
   main: {
+    // Baked in at build time: a packaged app has no runtime environment to
+    // read MULTICA_RELEASE_REPO from, so the desktop CLI bootstrap needs the
+    // repository fixed when the bundle is built. Release builds set the env
+    // from github.repository; unset leaves it empty and the bootstrap falls
+    // back to upstream.
+    define: {
+      __MULTICA_RELEASE_REPO__: JSON.stringify(
+        process.env.MULTICA_RELEASE_REPO ?? "",
+      ),
+    },
     plugins: [externalizeDepsPlugin()],
   },
   preload: {

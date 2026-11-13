@@ -14,10 +14,23 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-REPO_URL="https://github.com/multica-ai/multica.git"
-REPO_WEB_URL="https://github.com/multica-ai/multica"  # without .git, for GitHub web APIs
+# Releases, the self-host checkout, and the Homebrew tap can be repointed at a
+# fork without editing this script. MULTICA_RELEASE_REPO takes `owner/name` and
+# drives both the GitHub Releases the CLI is downloaded from and the repository
+# cloned for `--with-server`; MULTICA_BREW_PACKAGE overrides the tap formula.
+# Every default is upstream, so an unmodified install behaves exactly as before.
+MULTICA_RELEASE_REPO="${MULTICA_RELEASE_REPO:-multica-ai/multica}"
+if [[ ! "$MULTICA_RELEASE_REPO" =~ ^[^/[:space:]]+/[^/[:space:]]+$ ]]; then
+  echo "invalid MULTICA_RELEASE_REPO '$MULTICA_RELEASE_REPO' (expected owner/name)" >&2
+  exit 2
+fi
+RELEASE_WEB_URL="https://github.com/${MULTICA_RELEASE_REPO}"
+REPO_URL="${MULTICA_REPO_URL:-${RELEASE_WEB_URL}.git}"
+REPO_WEB_URL="${MULTICA_REPO_WEB_URL:-$RELEASE_WEB_URL}"  # without .git, for GitHub web APIs
 INSTALL_DIR="${MULTICA_INSTALL_DIR:-$HOME/.multica/server}"
-BREW_PACKAGE="multica-ai/tap/multica"
+BREW_PACKAGE="${MULTICA_BREW_PACKAGE:-multica-ai/tap/multica}"
+# `brew tap` wants `owner/repo`, which is the formula's first two path segments.
+BREW_TAP="${BREW_PACKAGE%/*}"
 
 # Host ports Compose reported after `up -d`; set by setup_server and reused by
 # the summary so the health check and the printed URLs cannot diverge.
@@ -93,7 +106,7 @@ detect_os() {
     Linux)  OS="linux" ;;
     MINGW*|MSYS*|CYGWIN*)
             fail "This script does not support Windows. Use the PowerShell installer instead:
-  irm https://raw.githubusercontent.com/multica-ai/multica/main/scripts/install.ps1 | iex" ;;
+  irm https://raw.githubusercontent.com/${MULTICA_RELEASE_REPO}/main/scripts/install.ps1 | iex" ;;
     *)      fail "Unsupported operating system: $(uname -s). Multica supports macOS, Linux, and Windows." ;;
   esac
 
@@ -121,7 +134,7 @@ install_cli_brew() {
   info "Installing Multica CLI via Homebrew..."
   local brew_log
   brew_log=$(mktemp)
-  if ! brew tap multica-ai/tap >"$brew_log" 2>&1; then
+  if ! brew tap "$BREW_TAP" >"$brew_log" 2>&1; then
     warn "Failed to add Homebrew tap. Falling back to GitHub Releases binary install."
     _dump_brew_log "$brew_log"
     rm -f "$brew_log"
@@ -149,13 +162,13 @@ install_cli_binary() {
 
   # Get latest release tag
   local latest
-  latest=$(curl -sI "$REPO_WEB_URL/releases/latest" 2>/dev/null | grep -i '^location:' | sed 's/.*tag\///' | tr -d '\r\n' || true)
+  latest=$(curl -sI "$RELEASE_WEB_URL/releases/latest" 2>/dev/null | grep -i '^location:' | sed 's/.*tag\///' | tr -d '\r\n' || true)
   if [ -z "$latest" ]; then
-    fail "Could not determine latest release. Check your network connection."
+    fail "Could not determine latest release from $MULTICA_RELEASE_REPO. Check your network connection."
   fi
 
   local version="${latest#v}"
-  local url="https://github.com/multica-ai/multica/releases/download/${latest}/multica-cli-${version}-${OS}-${ARCH}.tar.gz"
+  local url="${RELEASE_WEB_URL}/releases/download/${latest}/multica-cli-${version}-${OS}-${ARCH}.tar.gz"
   local tmp_dir
   tmp_dir=$(mktemp -d)
 
@@ -390,10 +403,18 @@ setup_server() {
       sed -i '' "s/^JWT_SECRET=.*/JWT_SECRET=$jwt/" .env
       sed -i '' "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$pgpass/" .env
       sed -i '' -E "s#^(DATABASE_URL=postgres://[^:]+:)[^@]*(@.*)#\1$pgpass\2#" .env
+      # Images publish to the release repository's owner namespace
+      # (ghcr.io/<owner>/multica-{backend,web}), so a fork installs what its
+      # own tag built instead of upstream's. Identical to .env.example on the
+      # canonical repository.
+      sed -i '' -E "s#^MULTICA_BACKEND_IMAGE=.*#MULTICA_BACKEND_IMAGE=ghcr.io/${MULTICA_RELEASE_REPO%%/*}/multica-backend#" .env
+      sed -i '' -E "s#^MULTICA_WEB_IMAGE=.*#MULTICA_WEB_IMAGE=ghcr.io/${MULTICA_RELEASE_REPO%%/*}/multica-web#" .env
     else
       sed -i "s/^JWT_SECRET=.*/JWT_SECRET=$jwt/" .env
       sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$pgpass/" .env
       sed -i -E "s#^(DATABASE_URL=postgres://[^:]+:)[^@]*(@.*)#\1$pgpass\2#" .env
+      sed -i -E "s#^MULTICA_BACKEND_IMAGE=.*#MULTICA_BACKEND_IMAGE=ghcr.io/${MULTICA_RELEASE_REPO%%/*}/multica-backend#" .env
+      sed -i -E "s#^MULTICA_WEB_IMAGE=.*#MULTICA_WEB_IMAGE=ghcr.io/${MULTICA_RELEASE_REPO%%/*}/multica-web#" .env
     fi
     ok "Generated .env with random JWT_SECRET and POSTGRES_PASSWORD"
   else
@@ -461,7 +482,7 @@ run_default() {
   printf "\n"
   print_remote_server_token_hint
   printf "  ${BOLD}Self-hosting?${RESET} Install the server first:\n"
-  printf "     curl -fsSL https://raw.githubusercontent.com/multica-ai/multica/main/scripts/install.sh | bash -s -- --with-server\n"
+  printf "     curl -fsSL https://raw.githubusercontent.com/${MULTICA_RELEASE_REPO}/main/scripts/install.sh | bash -s -- --with-server\n"
   printf "\n"
 }
 
@@ -496,7 +517,7 @@ run_with_server() {
   printf "  or read the generated code from backend logs when Resend is unset.\n"
   printf "\n"
   printf "  ${BOLD}To stop all services:${RESET}\n"
-  printf "     curl -fsSL https://raw.githubusercontent.com/multica-ai/multica/main/scripts/install.sh | bash -s -- --stop\n"
+  printf "     curl -fsSL https://raw.githubusercontent.com/${MULTICA_RELEASE_REPO}/main/scripts/install.sh | bash -s -- --stop\n"
   printf "\n"
 }
 

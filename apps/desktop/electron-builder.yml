@@ -129,6 +129,10 @@ win:
   artifactName: multica-desktop-${version}-windows-${arch}.${ext}
 publish:
   provider: github
+  # Upstream defaults. Release builds on another repository override both with
+  # `-c.publish.owner=… -c.publish.repo=…` (see .github/workflows/release.yml);
+  # literals stay here because an `${env.…}` macro throws when unset, which
+  # would break every local `pnpm package` that never defines those variables.
   owner: multica-ai
   repo: multica
   # Align with our CLI release flow which pre-creates a *published* GitHub

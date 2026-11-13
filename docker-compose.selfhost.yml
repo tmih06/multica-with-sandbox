@@ -53,7 +53,10 @@ services:
       retries: 5
 
   backend:
-    image: ${MULTICA_BACKEND_IMAGE:-ghcr.io/multica-ai/multica-backend}:${MULTICA_IMAGE_TAG:-latest}
+    # Default image comes from the release repository's owner, so a fork
+    # checkout pulls the images its own tag built. Identical to upstream when
+    # MULTICA_RELEASE_REPO is unset.
+    image: ${MULTICA_BACKEND_IMAGE:-ghcr.io/${MULTICA_IMAGE_OWNER:-multica-ai}/multica-backend}:${MULTICA_IMAGE_TAG:-latest}
     depends_on:
       postgres:
         condition: service_healthy
@@ -240,7 +243,7 @@ services:
     restart: unless-stopped
 
   frontend:
-    image: ${MULTICA_WEB_IMAGE:-ghcr.io/multica-ai/multica-web}:${MULTICA_IMAGE_TAG:-latest}
+    image: ${MULTICA_WEB_IMAGE:-ghcr.io/${MULTICA_IMAGE_OWNER:-multica-ai}/multica-web}:${MULTICA_IMAGE_TAG:-latest}
     depends_on:
       - backend
     ports:

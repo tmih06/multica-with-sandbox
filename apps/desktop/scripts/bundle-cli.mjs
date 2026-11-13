@@ -93,6 +93,21 @@ function hasGo() {
   }
 }
 
+// The repository whose releases the bundled CLI updates from. Release builds
+// pass MULTICA_RELEASE_REPO; a local build falls back to the checkout's origin
+// so a fork's desktop app does not quietly follow upstream's releases. An
+// unparseable origin yields an empty flag, leaving the Go default in place.
+function releaseRepoSlug() {
+  const configured = (process.env.MULTICA_RELEASE_REPO ?? "").trim();
+  if (/^[^/\s]+\/[^/\s]+$/.test(configured)) return configured;
+  const remote = git("config", "--get", "remote.origin.url");
+  const match = remote
+    .replace(/\.git$/, "")
+    .replace(/\/$/, "")
+    .match(/github\.com[:/]([^/\s]+\/[^/\s]+)$/);
+  return match ? match[1] : "";
+}
+
 async function exists(p) {
   try {
     await access(p, constants.F_OK);
@@ -107,7 +122,11 @@ if (hasGo()) {
   const commit = git("rev-parse", "--short", "HEAD") || "unknown";
   const buildCommit = git("rev-parse", "HEAD") || "unknown";
   const date = new Date().toISOString().replace(/\.\d+Z$/, "Z");
-  const ldflags = `-X main.version=${version} -X main.commit=${commit} -X main.buildCommit=${buildCommit} -X main.date=${date}`;
+  const repoSlug = releaseRepoSlug();
+  const repoLdflag = repoSlug
+    ? ` -X github.com/multica-ai/multica/server/internal/cli.defaultReleaseRepo=${repoSlug}`
+    : "";
+  const ldflags = `-X main.version=${version} -X main.commit=${commit} -X main.buildCommit=${buildCommit} -X main.date=${date}${repoLdflag}`;
 
   console.log(
     `[bundle-cli] go build → ${srcBinary} (${goos}/${goarch}, version=${version} commit=${commit})`,

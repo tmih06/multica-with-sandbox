@@ -82,12 +82,11 @@ jobs:
 
   release:
     needs: verify
-    # Only run on the canonical upstream repo. Forks don't have the
-    # HOMEBREW_TAP_GITHUB_TOKEN secret and should not be publishing to
-    # `multica-ai/homebrew-tap` anyway. Without this guard, every fork's
-    # tag push fails this job (401 against the upstream tap), which makes
-    # downstream CI go red without affecting the actual artifact pipeline.
-    if: github.repository_owner == 'multica-ai'
+    # Publishing targets this repository, derived from github.repository, so a
+    # fork release lands on the fork. A fork has no HOMEBREW_TAP_GITHUB_TOKEN,
+    # so the Homebrew formula push is skipped there (see goreleaser's
+    # `brews[].skip_upload`, driven by RELEASE_HOMEBREW_ENABLED below) while
+    # CLI archives, checksums, and the GitHub Release still publish.
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -114,7 +113,14 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The tap token only exists on the canonical repository. Set the
+          # formula's skip_upload so a fork publishes its release artifacts
+          # without attempting a push against upstream's tap.
           HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+          RELEASE_HOMEBREW_ENABLED: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN != '' }}
+          # Stamped into the CLI so `multica update` and the daemon's
+          # auto-updater poll this repository's releases, not upstream's.
+          MULTICA_RELEASE_REPO: ${{ github.repository }}
 
   # Multi-arch images are built natively per platform on dedicated runners
   # (amd64 on ubuntu-latest, arm64 on ubuntu-24.04-arm) and merged into a
@@ -356,7 +362,8 @@ jobs:
 
   helm-chart:
     needs: [verify, docker-backend-merge, docker-web-merge]
-    if: github.repository_owner == 'multica-ai'
+    # Publishes to this repository owner's GHCR namespace, so a fork release
+    # gets its own chart at oci://ghcr.io/<fork-owner>/charts/multica.
     runs-on: ubuntu-latest
     concurrency:
       group: release-helm-chart-${{ github.ref }}
@@ -374,10 +381,17 @@ jobs:
       - name: Sync chart metadata with release tag
         env:
           TAG_NAME: ${{ needs.verify.outputs.tag_name }}
+          # Images are published to this owner's namespace, so the packaged
+          # chart must reference them. On the canonical repository the result
+          # is identical to the checked-in values.
+          IMAGE_OWNER: ${{ github.repository_owner }}
         run: |
           chart_version="${TAG_NAME#v}"
           sed -i -E "s/^version:.*/version: ${chart_version}/" "$CHART_DIR/Chart.yaml"
           sed -i -E "s/^appVersion:.*/appVersion: \"${TAG_NAME}\"/" "$CHART_DIR/Chart.yaml"
+          sed -i -E "s#^(    repository: ghcr\.io/)[^/]+/multica-backend#\1${IMAGE_OWNER}/multica-backend#" "$CHART_DIR/values.yaml"
+          sed -i -E "s#^(    repository: ghcr\.io/)[^/]+/multica-web#\1${IMAGE_OWNER}/multica-web#" "$CHART_DIR/values.yaml"
+          grep -n 'ghcr.io/' "$CHART_DIR/values.yaml"
           echo "CHART_VERSION=${chart_version}" >> "$GITHUB_ENV"
 
       - name: Lint chart
@@ -459,4 +473,49 @@ jobs:
           # trust boundary. Set CSC_LINK in repo secrets to enable
           # Windows signing later.
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
-        run: node scripts/package.mjs --${{ matrix.target }} --x64 --arm64 --publish always
+          # Baked into the main bundle so a bundled-CLI repair downloads this
+          # repository's artifacts rather than upstream's.
+          MULTICA_RELEASE_REPO: ${{ github.repository }}
+          TARGET: ${{ matrix.target }}
+        # Required: this matrix also runs on windows-latest, where the default
+        # shell is PowerShell and the parameter expansion below is not valid.
+        shell: bash
+        run: |
+          # Build only here; the upload is a separate awaited step.
+          #
+          # electron-builder's own publisher writes its release artifacts
+          # asynchronously and the process returns before they finish: a run
+          # that logged every "uploading" line still exited with the release
+          # untouched, because the Node event loop drained at ~8s while the
+          # last asset's upload was still in flight. An explicit `gh release
+          # upload` blocks until the transfer completes and reports a
+          # non-zero status on failure, which is what a release job needs.
+          node scripts/package.mjs "--${TARGET}" --x64 --arm64 --publish never
+
+      - name: Upload Desktop installers (${{ matrix.target }})
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          shopt -s nullglob
+          # A multi-arch run writes each target into its own scoped output
+          # directory (dist/linux-x64, dist/linux-arm64, ...), so these globs
+          # have to span one level. Autoupdate manifests are the `latest*.yml`
+          # files; builder-debug.yml and builder-effective-config.yaml describe
+          # the local build and must not ship.
+          assets=(
+            apps/desktop/dist/*/*.AppImage
+            apps/desktop/dist/*/*.deb
+            apps/desktop/dist/*/*.rpm
+            apps/desktop/dist/*/*.exe
+            apps/desktop/dist/*/*.blockmap
+            apps/desktop/dist/*/latest*.yml
+          )
+          if [ ${#assets[@]} -eq 0 ]; then
+            echo "::error::no Desktop installers were produced"
+            exit 1
+          fi
+          printf 'uploading %s\n' "${assets[@]}"
+          # --clobber makes a same-tag rerun replace assets instead of failing.
+          gh release upload "$tag" "${assets[@]}" --clobber --repo "$GITHUB_REPOSITORY"
