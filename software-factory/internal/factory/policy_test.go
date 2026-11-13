@@ -2,6 +2,7 @@ package factory
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -70,5 +71,35 @@ func TestSandboxManifestSpreadsConcurrentRunsAcrossWorkers(t *testing.T) {
 	}
 	if constraint["whenUnsatisfiable"] != "DoNotSchedule" {
 		t.Fatalf("when unsatisfiable = %v, want DoNotSchedule", constraint["whenUnsatisfiable"])
+	}
+}
+
+func TestSandboxManifestCarriesRepositoryRevision(t *testing.T) {
+	runner := NewSandboxRunner("kubectl", "factory-test", "image", time.Minute)
+	manifest := runner.manifest("ticket-1", Ticket{ID: "ticket-1", Repository: "https://example.test/repo", Revision: "main", Policy: defaultExecutionPolicy()})
+	env := manifest["spec"].(map[string]any)["podTemplate"].(map[string]any)["spec"].(map[string]any)["containers"].([]any)[0].(map[string]any)["env"].([]any)
+	found := false
+	for _, raw := range env {
+		item := raw.(map[string]any)
+		if item["name"] == "FACTORY_REPOSITORY_REF" && item["value"] == "main" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("repository revision was not added to Sandbox environment")
+	}
+}
+
+func TestSandboxScriptSupportsOldAndEventCapableWorkers(t *testing.T) {
+	for _, fragment := range []string{
+		"durable run --help",
+		"--events-file",
+		"--control-file",
+		"durable resume",
+		"/workspace/state/job.json",
+	} {
+		if !strings.Contains(agentScript, fragment) {
+			t.Fatalf("agent script missing compatibility fragment %q", fragment)
+		}
 	}
 }

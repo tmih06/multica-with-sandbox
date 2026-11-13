@@ -72,6 +72,7 @@ type Ticket struct {
 	Title      string          `json:"title"`
 	Prompt     string          `json:"prompt"`
 	Repository string          `json:"repository,omitempty"`
+	Revision   string          `json:"revision,omitempty"`
 	Model      string          `json:"model,omitempty"`
 	Status     Status          `json:"status"`
 	Sandbox    string          `json:"sandbox,omitempty"`
@@ -100,11 +101,46 @@ type TicketInput struct {
 type RunResult struct {
 	Answer string
 	Logs   string
+	Usage  []UsageReport
+	Events []WorkerEvent
+}
+
+// WorkerEvent is a structured durable-worker transcript event.
+type WorkerEvent struct {
+	ID      string         `json:"id,omitempty"`
+	Type    string         `json:"type"`
+	CallID  string         `json:"call_id,omitempty"`
+	Tool    string         `json:"tool,omitempty"`
+	Content string         `json:"content,omitempty"`
+	Input   map[string]any `json:"input,omitempty"`
+	Output  string         `json:"output,omitempty"`
+	Usage   *UsageReport   `json:"usage,omitempty"`
+}
+
+// UsageReport is the worker-neutral token receipt emitted by ompig-slim.
+type UsageReport struct {
+	Provider         string  `json:"provider"`
+	Model            string  `json:"model"`
+	InputTokens      int     `json:"input_tokens"`
+	OutputTokens     int     `json:"output_tokens"`
+	CacheReadTokens  int     `json:"cache_read_tokens"`
+	CacheWriteTokens int     `json:"cache_write_tokens"`
+	CostUSD          float64 `json:"cost_usd,omitempty"`
 }
 
 // Runner executes one ticket in an isolated workspace.
 type Runner interface {
 	Run(context.Context, Ticket) (RunResult, error)
+}
+
+// EventRunner is an optional Runner extension for live worker events.
+type EventRunner interface {
+	RunWithEvents(context.Context, Ticket, func(WorkerEvent)) (RunResult, error)
+}
+
+// ControlRunner accepts supplemental user instructions during execution.
+type ControlRunner interface {
+	SendControl(context.Context, Ticket, string) error
 }
 
 // RecoveryRunner can reattach to a persisted run after the factory restarts.
@@ -530,7 +566,25 @@ func (r *SandboxRunner) timeoutFor(ticket Ticket) time.Duration {
 	return r.Timeout
 }
 
-func (r *SandboxRunner) Run(parent context.Context, ticket Ticket) (result RunResult, runErr error) {
+func (r *SandboxRunner) Run(parent context.Context, ticket Ticket) (RunResult, error) {
+	return r.runWithEvents(parent, ticket, nil)
+}
+
+func (r *SandboxRunner) RunWithEvents(parent context.Context, ticket Ticket, sink func(WorkerEvent)) (RunResult, error) {
+	return r.runWithEvents(parent, ticket, sink)
+}
+
+func (r *SandboxRunner) SendControl(ctx context.Context, ticket Ticket, content string) error {
+	payload, err := json.Marshal(map[string]string{"content": content})
+	if err != nil {
+		return err
+	}
+	payload = append(payload, '\n')
+	_, err = r.run(ctx, payload, "exec", "-i", "pod/"+sandboxName(ticket.ID), "-n", r.Namespace, "--", "sh", "-c", "cat >> /workspace/control.jsonl")
+	return err
+}
+
+func (r *SandboxRunner) runWithEvents(parent context.Context, ticket Ticket, sink func(WorkerEvent)) (result RunResult, runErr error) {
 	if r.limiter != nil {
 		select {
 		case r.limiter <- struct{}{}:
@@ -564,7 +618,7 @@ func (r *SandboxRunner) Run(parent context.Context, ticket Ticket) (result RunRe
 		return result, err
 	}
 	result.Logs += "phase=sandbox-ready\n"
-	phase, err := r.waitForPod(ctx, name)
+	phase, err := r.waitForPodEvents(ctx, name, sink)
 	if err != nil {
 		result.Logs += "phase=pod-wait-failed\n" + err.Error() + "\n"
 		return result, err
@@ -576,10 +630,38 @@ func (r *SandboxRunner) Run(parent context.Context, ticket Ticket) (result RunRe
 		return result, err
 	}
 	result.Answer = podLogs
+	if receipt, ok := parseWorkerReceipt(podLogs); ok {
+		result.Answer = receipt.Answer
+		result.Usage = receipt.Usage
+		result.Events = receipt.Events
+	}
 	if phase != "Succeeded" {
 		return result, fmt.Errorf("sandbox pod ended in phase %s", phase)
 	}
 	return result, nil
+}
+
+type workerReceipt struct {
+	Status string        `json:"status"`
+	Answer string        `json:"answer"`
+	Usage  []UsageReport `json:"usage"`
+	Events []WorkerEvent `json:"events"`
+}
+
+// parseWorkerReceipt extracts the durable worker's final JSON receipt from Pod
+// logs while retaining the complete logs for the factory audit trail.
+func parseWorkerReceipt(logs string) (workerReceipt, bool) {
+	for _, line := range strings.Split(logs, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || !strings.HasPrefix(line, "{") {
+			continue
+		}
+		var receipt workerReceipt
+		if json.Unmarshal([]byte(line), &receipt) == nil && receipt.Status != "" {
+			return receipt, true
+		}
+	}
+	return workerReceipt{}, false
 }
 
 func (r *SandboxRunner) apply(ctx context.Context, name string, ticket Ticket) error {
@@ -602,10 +684,13 @@ func (r *SandboxRunner) apply(ctx context.Context, name string, ticket Ticket) e
 func (r *SandboxRunner) manifest(name string, ticket Ticket) map[string]any {
 	env := []any{
 		map[string]any{"name": "FACTORY_REPOSITORY", "value": ticket.Repository},
+		map[string]any{"name": "FACTORY_REPOSITORY_REF", "value": ticket.Revision},
 		map[string]any{"name": "FACTORY_MODEL", "value": ticket.Model},
 		map[string]any{"name": "FACTORY_PROMPT", "value": ticket.Prompt},
 		map[string]any{"name": "FACTORY_REQUEST_ID", "value": ticket.ID},
 		map[string]any{"name": "FACTORY_MAX_TURNS", "value": fmt.Sprintf("%d", ticket.Policy.MaxTurns)},
+		map[string]any{"name": "FACTORY_EVENTS_FILE", "value": "/workspace/events.jsonl"},
+		map[string]any{"name": "FACTORY_CONTROL_FILE", "value": "/workspace/control.jsonl"},
 	}
 	if r.MulticaURL != "" {
 		env = append(env, map[string]any{"name": "MULTICA_SERVER_URL", "value": r.MulticaURL})
@@ -671,8 +756,12 @@ func (r *SandboxRunner) manifest(name string, ticket Ticket) map[string]any {
 
 const agentScript = `set -eu
 mkdir -p /workspace/state
-if [ -n "$FACTORY_REPOSITORY" ]; then
-  git clone --depth=1 "$FACTORY_REPOSITORY" /workspace/repo
+if [ -n "$FACTORY_REPOSITORY" ] && [ ! -d /workspace/repo/.git ]; then
+  if [ -n "$FACTORY_REPOSITORY_REF" ]; then
+    git clone --depth=1 --branch "$FACTORY_REPOSITORY_REF" "$FACTORY_REPOSITORY" /workspace/repo
+  else
+    git clone --depth=1 "$FACTORY_REPOSITORY" /workspace/repo
+  fi
 else
   mkdir -p /workspace/repo
 fi
@@ -680,7 +769,21 @@ if [ -z "$FACTORY_MODEL" ]; then
   printf '%s\n' '{"status":"done","answer":"workspace prepared; no model requested"}'
   exit 0
 fi
-exec ompig-slim durable run --state /workspace/state --cwd /workspace/repo --model "$FACTORY_MODEL" --request-id "$FACTORY_REQUEST_ID" --max-turns "$FACTORY_MAX_TURNS" "$FACTORY_PROMPT"`
+EVENT_ARGS=""
+CONTROL_ARGS=""
+HELP=$(ompig-slim durable run --help 2>&1 || true)
+if printf '%s\n' "$HELP" | grep -q -- '--events-file'; then
+  EVENT_ARGS="--events-file $FACTORY_EVENTS_FILE"
+fi
+if printf '%s\n' "$HELP" | grep -q -- '--control-file'; then
+  CONTROL_ARGS="--control-file $FACTORY_CONTROL_FILE"
+fi
+if [ -f /workspace/state/job.json ]; then
+  # shellcheck disable=SC2086
+  exec ompig-slim durable resume --state /workspace/state $EVENT_ARGS $CONTROL_ARGS
+fi
+# shellcheck disable=SC2086
+exec ompig-slim durable run --state /workspace/state --cwd /workspace/repo --model "$FACTORY_MODEL" --request-id "$FACTORY_REQUEST_ID" --max-turns "$FACTORY_MAX_TURNS" $EVENT_ARGS $CONTROL_ARGS "$FACTORY_PROMPT"`
 
 func (r *SandboxRunner) waitForReady(ctx context.Context, name string) error {
 	for {
@@ -718,7 +821,24 @@ func (r *SandboxRunner) waitForReady(ctx context.Context, name string) error {
 }
 
 func (r *SandboxRunner) waitForPod(ctx context.Context, name string) (string, error) {
+	return r.waitForPodEvents(ctx, name, nil)
+}
+
+func (r *SandboxRunner) waitForPodEvents(ctx context.Context, name string, sink func(WorkerEvent)) (string, error) {
+	seen := 0
 	for {
+		if sink != nil {
+			if data, err := r.output(ctx, "exec", "pod/"+name, "-n", r.Namespace, "--", "cat", "/workspace/events.jsonl"); err == nil {
+				lines := strings.Split(string(data), "\n")
+				for _, line := range lines[seen:] {
+					var event WorkerEvent
+					if json.Unmarshal([]byte(strings.TrimSpace(line)), &event) == nil && event.Type != "" {
+						sink(event)
+					}
+				}
+				seen = len(lines)
+			}
+		}
 		data, err := r.output(ctx, "get", "pod", name, "-n", r.Namespace, "-o", "json")
 		if err == nil {
 			var object struct {

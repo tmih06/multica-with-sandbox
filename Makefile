@@ -1,4 +1,4 @@
-.PHONY: help makehelp dev server daemon cli multica factory-test factory-run build test migrate-up migrate-down sqlc seed clean setup start stop check worktree-env setup-main start-main stop-main check-main setup-worktree start-worktree stop-worktree check-worktree remove-worktree db-up db-down db-drop db-reset selfhost selfhost-build selfhost-stop up down status list destroy gc env-exec api-dev web-dev desktop-dev
+.PHONY: help makehelp dev server daemon cli multica factory-test factory-run factory-image build test migrate-up migrate-down sqlc seed clean setup start stop check worktree-env setup-main start-main stop-main check-main setup-worktree start-worktree stop-worktree check-worktree remove-worktree db-up db-down db-drop db-reset selfhost selfhost-build selfhost-stop up down status list destroy gc env-exec api-dev web-dev desktop-dev
 
 MAIN_ENV_FILE ?= .env
 WORKTREE_ENV_FILE ?= .env.worktree
@@ -189,6 +189,12 @@ factory-run: ## Run the in-repo Kubernetes Sandbox backend
 
 factory-test: ## Run tests for the in-repo Kubernetes Sandbox backend
 	cd software-factory && go test ./...
+
+OMPIG_ROOT ?= ../ompig-slim
+FACTORY_IMAGE ?= ompig-slim-workspace:dev
+
+factory-image: ## Build the event-capable ompig-slim workspace image for the factory
+	docker build -f $(OMPIG_ROOT)/Dockerfile.workspace -t $(FACTORY_IMAGE) $(OMPIG_ROOT)
 
 web-dev: ## Run only the Next.js dev server for the current env file
 	pnpm dev:web

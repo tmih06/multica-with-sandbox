@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -22,6 +24,17 @@ import (
 type RuntimeSlot struct {
 	DaemonID  string
 	RuntimeID string
+}
+
+type pendingLifecycle struct {
+	Path string
+	Body any
+}
+
+type pendingCallbackStore interface {
+	SavePendingCallback(string, string, any) error
+	DeletePendingCallback(string) error
+	PendingCallbacks() ([]pendingCallback, error)
 }
 
 type MulticaTaskBridge struct {
@@ -42,6 +55,12 @@ type MulticaTaskBridge struct {
 	RuntimeMu         sync.RWMutex
 	RunningMu         sync.Mutex
 	Running           map[string]context.CancelFunc
+	MessageSeq        map[string]int
+	UsageMu           sync.Mutex
+	Usage             map[string]map[string]UsageReport
+	PendingMu         sync.Mutex
+	Pending           map[string]pendingLifecycle
+	PendingStore      pendingCallbackStore
 }
 
 // NewMulticaTaskBridge constructs a bridge. A missing Multica URL or token is
@@ -59,7 +78,7 @@ func NewMulticaTaskBridge(client *MulticaClient, workspaceID, daemonID, provider
 		Provider: provider, Repository: repository, PollInterval: pollInterval,
 		AgentName: "Sandbox Builder", AgentModel: "deploy/deepseek-ai/deepseek-v4.1-flash-1017",
 		AgentThinking: "medium", AgentInstructions: "Work on the assigned issue. Make the requested changes, run relevant tests, and report the result.",
-		Capacity: capacity, Runner: runner, Running: make(map[string]context.CancelFunc),
+		Capacity: capacity, Runner: runner, Running: make(map[string]context.CancelFunc), MessageSeq: make(map[string]int), Usage: make(map[string]map[string]UsageReport), Pending: make(map[string]pendingLifecycle),
 	}
 }
 
@@ -67,7 +86,10 @@ func NewMulticaTaskBridge(client *MulticaClient, workspaceID, daemonID, provider
 // registration when the parent context ends. At most the runner's configured
 // worker capacity is exercised because each poll claims only available slots.
 func (b *MulticaTaskBridge) Run(ctx context.Context) error {
-	defer b.deregister(context.Background())
+	defer func() {
+		b.flushPending(context.Background())
+		b.deregister(context.Background())
+	}()
 	ticker := time.NewTicker(b.PollInterval)
 	defer ticker.Stop()
 	for {
@@ -192,6 +214,14 @@ func (b *MulticaTaskBridge) claim(ctx context.Context) error {
 	if len(slots) == 0 {
 		return b.register(ctx)
 	}
+	b.flushPending(ctx)
+	// Heartbeat every slot before admission accounting. A full bridge still
+	// owns active runtimes and must not let them expire while their Sandboxes run.
+	for _, slot := range slots {
+		if err := b.Client.Post(ctx, "/api/daemon/heartbeat", map[string]any{"runtime_id": slot.RuntimeID}, nil); err != nil {
+			return err
+		}
+	}
 	b.RunningMu.Lock()
 	available := b.Capacity - len(b.Running)
 	b.RunningMu.Unlock()
@@ -199,9 +229,6 @@ func (b *MulticaTaskBridge) claim(ctx context.Context) error {
 		return nil
 	}
 	for _, slot := range slots {
-		if err := b.Client.Post(ctx, "/api/daemon/heartbeat", map[string]any{"runtime_id": slot.RuntimeID}, nil); err != nil {
-			return err
-		}
 		if available <= 0 {
 			break
 		}
@@ -239,26 +266,87 @@ func (b *MulticaTaskBridge) execute(parent context.Context, task MulticaTask) {
 		cancel()
 		b.RunningMu.Lock()
 		delete(b.Running, task.ID)
+		delete(b.MessageSeq, task.ID)
 		b.RunningMu.Unlock()
+		b.UsageMu.Lock()
+		delete(b.Usage, task.ID)
+		b.UsageMu.Unlock()
 	}()
 
-	startBody := map[string]any{"runtime_id": task.RuntimeID}
+	startBody := map[string]any{
+		"runtime_id":   task.RuntimeID,
+		"capabilities": []string{"task-supplement-v1", "pi-process-cleanup-v1", "checkout-keeps-work-v1"},
+	}
 	if task.DispatchedAt != "" {
 		startBody["dispatched_at"] = task.DispatchedAt
 	}
-	if err := b.Client.Post(ctx, "/api/daemon/tasks/"+task.ID+"/start", startBody, nil); err != nil {
+	if err := b.postLifecycle(ctx, "/api/daemon/tasks/"+task.ID+"/start", startBody); err != nil {
 		log.Printf("multica task %s start failed (token=%t): %v", task.ID, task.AuthToken != "", err)
 		return
 	}
+	b.reportProgress(ctx, task.ID, "Sandbox started", 1, 3)
 
 	ticket := task.ticket(b.Repository)
+	if task.PriorSessionID != "" || task.PriorWorkDir != "" {
+		ticket.Prompt += fmt.Sprintf("\n\nPrior execution context: session=%s work_dir=%s. Inspect the existing workspace before assuming prior work is present.", task.PriorSessionID, task.PriorWorkDir)
+	}
+	if ticket.Model == "" {
+		ticket.Model = b.AgentModel
+		ticket.Policy.Model = b.AgentModel
+	}
+	if ticket.Policy.Thinking == "" {
+		ticket.Policy.Thinking = b.AgentThinking
+	}
+	if task.IssueID == "" {
+		sections := []string{}
+		if strings.TrimSpace(task.QuickCreatePrompt) != "" {
+			sections = append(sections, task.QuickCreatePrompt)
+		}
+		if strings.TrimSpace(task.AutopilotTitle) != "" || strings.TrimSpace(task.AutopilotDescription) != "" {
+			sections = append(sections, fmt.Sprintf("Autopilot: %s\n%s", task.AutopilotTitle, task.AutopilotDescription))
+		}
+		if strings.TrimSpace(task.WorkspaceContext) != "" {
+			sections = append(sections, "Workspace context:\n"+task.WorkspaceContext)
+		}
+		if len(task.ProjectResources) > 0 {
+			if resources, err := json.Marshal(task.ProjectResources); err == nil {
+				sections = append(sections, "Project resources:\n"+string(resources))
+			}
+		}
+		if len(task.AutopilotTriggerPayload) > 0 {
+			sections = append(sections, "Autopilot trigger payload:\n"+string(task.AutopilotTriggerPayload))
+		}
+		for _, comment := range task.CoalescedComments {
+			sections = append(sections, "Additional task comment:\n"+comment.Content)
+		}
+		if len(sections) > 0 {
+			sections = append(sections, task.Agent.Instructions)
+			ticket.Prompt = strings.TrimSpace(strings.Join(sections, "\n\n"))
+		}
+	}
 	issue := struct {
 		Title       string `json:"title"`
 		Description string `json:"description"`
 	}{}
 	if task.IssueID != "" {
 		if err := b.Client.Get(ctx, "/api/issues/"+task.IssueID, &issue); err == nil {
-			ticket.Prompt = strings.TrimSpace(fmt.Sprintf("Work on Multica issue %s: %s\n\n%s\n\n%s", task.IssueIdentifier, issue.Title, issue.Description, task.Agent.Instructions))
+			sections := []string{fmt.Sprintf("Work on Multica issue %s: %s", task.IssueIdentifier, issue.Title), issue.Description}
+			if strings.TrimSpace(task.WorkspaceContext) != "" {
+				sections = append(sections, "Workspace context:\n"+task.WorkspaceContext)
+			}
+			if strings.TrimSpace(task.ProjectTitle) != "" || strings.TrimSpace(task.ProjectDescription) != "" {
+				sections = append(sections, fmt.Sprintf("Project: %s\n%s", task.ProjectTitle, task.ProjectDescription))
+			}
+			for _, comment := range task.CoalescedComments {
+				sections = append(sections, "Additional task comment:\n"+comment.Content)
+			}
+			if len(task.ProjectResources) > 0 {
+				if resources, err := json.Marshal(task.ProjectResources); err == nil {
+					sections = append(sections, "Project resources:\n"+string(resources))
+				}
+			}
+			sections = append(sections, task.Agent.Instructions)
+			ticket.Prompt = strings.TrimSpace(strings.Join(sections, "\n\n"))
 		} else {
 			log.Printf("multica task %s issue fetch failed: %v", task.ID, err)
 		}
@@ -268,80 +356,411 @@ func (b *MulticaTaskBridge) execute(parent context.Context, task MulticaTask) {
 		err    error
 	}, 1)
 	go func() {
-		result, err := b.Runner.Run(ctx, ticket)
+		var result RunResult
+		var err error
+		if runner, ok := b.Runner.(EventRunner); ok {
+			result, err = runner.RunWithEvents(ctx, ticket, func(event WorkerEvent) {
+				b.reportWorkerEvent(ctx, task.ID, event)
+			})
+		} else {
+			result, err = b.Runner.Run(ctx, ticket)
+		}
 		resultCh <- struct {
 			result RunResult
 			err    error
 		}{result: result, err: err}
 	}()
+	executionStartedAt := time.Now().UTC()
 	statusTicker := time.NewTicker(2 * time.Second)
 	defer statusTicker.Stop()
+	seenComments := make(map[string]struct{}, len(task.CoalescedComments))
+	for _, comment := range task.CoalescedComments {
+		seenComments[comment.ID] = struct{}{}
+	}
+	if task.IssueID != "" {
+		var existing []struct {
+			ID string `json:"id"`
+		}
+		if err := b.Client.Get(ctx, "/api/issues/"+task.IssueID+"/comments?summary=true", &existing); err == nil {
+			for _, comment := range existing {
+				seenComments[comment.ID] = struct{}{}
+			}
+		}
+	}
+	if task.ChatSessionID != "" {
+		var existing []struct {
+			ID string `json:"id"`
+		}
+		if err := b.Client.Get(ctx, "/api/chat/sessions/"+task.ChatSessionID+"/messages", &existing); err == nil {
+			for _, message := range existing {
+				seenComments[message.ID] = struct{}{}
+			}
+		}
+	}
 	var result RunResult
 	var runErr error
+	remoteCancelled := false
+	remoteTerminal := false
+	executionReturned := false
 	for {
 		select {
 		case outcome := <-resultCh:
 			result, runErr = outcome.result, outcome.err
+			executionReturned = true
 			goto executionFinished
 		case <-statusTicker.C:
+			b.reportProgress(ctx, task.ID, "Sandbox running", 2, 3)
+			if controller, ok := b.Runner.(ControlRunner); ok && (task.IssueID != "" || task.ChatSessionID != "") {
+				var comments []struct {
+					ID         string `json:"id"`
+					Content    string `json:"content"`
+					AuthorType string `json:"author_type"`
+					Role       string `json:"role"`
+				}
+				path := "/api/issues/" + task.IssueID + "/comments?since=" + url.QueryEscape(executionStartedAt.Format(time.RFC3339Nano))
+				if task.ChatSessionID != "" {
+					path = "/api/chat/sessions/" + task.ChatSessionID + "/messages"
+				}
+				if err := b.Client.Get(ctx, path, &comments); err == nil {
+					for _, comment := range comments {
+						if comment.ID == "" || comment.Content == "" || comment.AuthorType == "agent" || comment.AuthorType == "system" || (comment.Role != "" && comment.Role != "user") {
+							continue
+						}
+						if _, seen := seenComments[comment.ID]; seen {
+							continue
+						}
+						if err := controller.SendControl(ctx, ticket, comment.Content); err != nil {
+							log.Printf("multica task %s supplemental comment delivery failed: %v", task.ID, err)
+							continue
+						}
+						seenComments[comment.ID] = struct{}{}
+					}
+				}
+			}
 			var status struct {
 				Status string `json:"status"`
 			}
-			if err := b.Client.Get(ctx, "/api/daemon/tasks/"+task.ID+"/status", &status); err == nil && status.Status == "cancelled" {
-				cancel()
+			if err := b.Client.Get(ctx, "/api/daemon/tasks/"+task.ID+"/status", &status); err == nil {
+				switch status.Status {
+				case "running":
+					// Expected state while the Sandbox owns execution.
+				case "cancelled":
+					remoteCancelled = true
+					cancel()
+				default:
+					// queued/dispatched/waiting or any terminal state means this
+					// worker no longer owns execution and must stop.
+					remoteTerminal = true
+					cancel()
+				}
+			} else {
+				var httpErr *MulticaHTTPError
+				if errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusNotFound {
+					// A deleted task has no lifecycle callback left to acknowledge.
+					remoteTerminal = true
+					cancel()
+				}
 			}
 		case <-ctx.Done():
 			goto executionFinished
 		}
 	}
 executionFinished:
-	if ctx.Err() != nil {
-		log.Printf("multica task %s cancelled", task.ID)
-		_ = b.Client.Post(context.Background(), "/api/daemon/tasks/"+task.ID+"/cancel-ack", map[string]any{"process_cleanup_confirmed": true}, nil)
+	if remoteCancelled {
+		log.Printf("multica task %s cancelled remotely", task.ID)
+		b.postTerminal(task.ID, "/api/daemon/tasks/"+task.ID+"/cancel-ack", map[string]any{"process_cleanup_confirmed": true})
+		return
+	}
+	if remoteTerminal && !remoteCancelled {
+		log.Printf("multica task %s was already terminal remotely", task.ID)
+		return
+	}
+	if ctx.Err() != nil && !executionReturned {
+		if parent.Err() != nil {
+			// Factory shutdown is not a task cancellation. Leave the task for
+			// Multica's stale-runtime recovery rather than mutating its state.
+			log.Printf("multica task %s interrupted by factory shutdown", task.ID)
+			return
+		}
+		log.Printf("multica task %s exceeded its execution deadline", task.ID)
+		b.postTerminal(task.ID, "/api/daemon/tasks/"+task.ID+"/fail", map[string]any{
+			"error": "sandbox execution deadline exceeded", "failure_reason": "timeout",
+		})
 		return
 	}
 	if runErr != nil {
 		log.Printf("multica task %s sandbox failed: %v", task.ID, runErr)
-		_ = b.Client.Post(context.Background(), "/api/daemon/tasks/"+task.ID+"/fail", map[string]any{
+		b.reportProgress(context.Background(), task.ID, "Sandbox failed", 3, 3)
+		b.postTerminal(task.ID, "/api/daemon/tasks/"+task.ID+"/fail", map[string]any{
 			"error": runErr.Error(), "failure_reason": "sandbox_execution_failed",
-		}, nil)
+		})
 		return
 	}
+	// The runner currently returns the durable assistant answer as one value.
+	// Persist it as a normal task message before the terminal callback so the
+	// issue/chat transcript and live clients see the same answer as the daemon
+	// backend, rather than only receiving it through the completion payload.
+	events := result.Events
+	if len(events) == 0 && strings.TrimSpace(result.Answer) != "" {
+		events = []WorkerEvent{{Type: "text", Content: result.Answer}}
+	}
+	// Re-send the committed final event set after execution. Stable event IDs
+	// make this a loss-recovery pass for live callbacks, not a duplicate transcript.
+	b.reportWorkerEvents(context.Background(), task.ID, events)
+	b.reportUsage(context.Background(), task.ID, result.Usage, false)
+	b.reportProgress(context.Background(), task.ID, "Sandbox completed", 3, 3)
 	log.Printf("multica task %s sandbox completed", task.ID)
-	_ = b.Client.Post(context.Background(), "/api/daemon/tasks/"+task.ID+"/complete", map[string]any{
+	b.postTerminal(task.ID, "/api/daemon/tasks/"+task.ID+"/complete", map[string]any{
 		"output": result.Answer, "work_dir": "/workspace/repo",
-	}, nil)
+	})
+}
+
+func (b *MulticaTaskBridge) postTerminal(taskID, path string, body any) {
+	if err := b.postLifecycle(context.Background(), path, body); err == nil {
+		if b.PendingStore != nil {
+			_ = b.PendingStore.DeletePendingCallback(taskID)
+		}
+		return
+	}
+	b.PendingMu.Lock()
+	b.Pending[taskID] = pendingLifecycle{Path: path, Body: body}
+	b.PendingMu.Unlock()
+	if b.PendingStore != nil {
+		if err := b.PendingStore.SavePendingCallback(taskID, path, body); err != nil {
+			log.Printf("multica task %s pending callback persistence failed: %v", taskID, err)
+		}
+	}
+	log.Printf("multica task %s terminal callback queued for retry: %s", taskID, path)
+}
+
+func (b *MulticaTaskBridge) flushPending(ctx context.Context) {
+	if b.PendingStore != nil {
+		if stored, err := b.PendingStore.PendingCallbacks(); err == nil {
+			b.PendingMu.Lock()
+			for _, item := range stored {
+				b.Pending[item.TaskID] = pendingLifecycle{Path: item.Path, Body: item.Body}
+			}
+			b.PendingMu.Unlock()
+		} else {
+			log.Printf("pending callback load failed: %v", err)
+		}
+	}
+	b.PendingMu.Lock()
+	pending := make(map[string]pendingLifecycle, len(b.Pending))
+	for id, callback := range b.Pending {
+		pending[id] = callback
+	}
+	b.PendingMu.Unlock()
+	for taskID, callback := range pending {
+		if err := b.postLifecycle(ctx, callback.Path, callback.Body); err != nil {
+			log.Printf("multica task %s pending terminal callback failed: %v", taskID, err)
+			continue
+		}
+		b.PendingMu.Lock()
+		delete(b.Pending, taskID)
+		b.PendingMu.Unlock()
+		if b.PendingStore != nil {
+			_ = b.PendingStore.DeletePendingCallback(taskID)
+		}
+	}
+}
+
+// postLifecycle retries callbacks whose response may be lost after the server
+// commits the transition. Multica terminal callbacks are idempotent, so retrying
+// is safer than leaving a task permanently running on a transient network error.
+func (b *MulticaTaskBridge) postLifecycle(ctx context.Context, path string, body any) error {
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if err := b.Client.Post(ctx, path, body, nil); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		if attempt < 2 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(time.Duration(attempt+1) * 100 * time.Millisecond):
+			}
+		}
+	}
+	return lastErr
+}
+
+func (b *MulticaTaskBridge) reportWorkerEvent(ctx context.Context, taskID string, event WorkerEvent) {
+	if event.Usage != nil {
+		b.reportUsage(ctx, taskID, []UsageReport{*event.Usage}, true)
+		return
+	}
+	b.reportEvents(ctx, taskID, []WorkerEvent{event})
+}
+
+func (b *MulticaTaskBridge) reportWorkerEvents(ctx context.Context, taskID string, events []WorkerEvent) {
+	transcript := make([]WorkerEvent, 0, len(events))
+	for _, event := range events {
+		if event.Usage != nil {
+			b.reportUsage(ctx, taskID, []UsageReport{*event.Usage}, true)
+			continue
+		}
+		transcript = append(transcript, event)
+	}
+	b.reportEvents(ctx, taskID, transcript)
+}
+
+// reportEvents forwards the structured worker transcript using Multica's
+// daemon message vocabulary. Each event has a stable idempotency key so a
+// repeated terminal delivery cannot duplicate the transcript.
+func (b *MulticaTaskBridge) reportEvents(ctx context.Context, taskID string, events []WorkerEvent) {
+	messages := make([]map[string]any, 0, len(events))
+	b.RunningMu.Lock()
+	startSeq := b.MessageSeq[taskID]
+	b.MessageSeq[taskID] = startSeq + len(events)
+	b.RunningMu.Unlock()
+	for index, event := range events {
+		seq := startSeq + index + 1
+		messageType := event.Type
+		if messageType == "tool_call" {
+			messageType = "tool_use"
+		}
+		key := fmt.Sprintf("software-factory:%s:event:%d", taskID, seq)
+		if event.ID != "" {
+			key = "software-factory:" + taskID + ":event:" + event.ID
+		}
+		message := map[string]any{
+			"seq": seq, "type": messageType,
+			"call_id": event.CallID, "tool": event.Tool,
+			"content": event.Content, "input": event.Input, "output": event.Output,
+			"idempotency_key": key,
+		}
+		messages = append(messages, message)
+	}
+	if len(messages) == 0 {
+		return
+	}
+	if err := b.postLifecycle(ctx, "/api/daemon/tasks/"+taskID+"/messages", map[string]any{"messages": messages}); err != nil {
+		log.Printf("multica task %s event report failed: %v", taskID, err)
+	}
+}
+
+// reportUsage forwards the worker's authoritative cumulative usage receipt.
+func (b *MulticaTaskBridge) reportUsage(ctx context.Context, taskID string, usage []UsageReport, snapshot bool) {
+	if len(usage) == 0 {
+		return
+	}
+	if snapshot {
+		b.UsageMu.Lock()
+		byModel := b.Usage[taskID]
+		if byModel == nil {
+			byModel = make(map[string]UsageReport)
+			b.Usage[taskID] = byModel
+		}
+		for _, item := range usage {
+			key := item.Provider + "\x00" + item.Model
+			total := byModel[key]
+			total.Provider, total.Model = item.Provider, item.Model
+			total.InputTokens += item.InputTokens
+			total.OutputTokens += item.OutputTokens
+			total.CacheReadTokens += item.CacheReadTokens
+			total.CacheWriteTokens += item.CacheWriteTokens
+			total.CostUSD += item.CostUSD
+			byModel[key] = total
+		}
+		usage = make([]UsageReport, 0, len(byModel))
+		for _, item := range byModel {
+			usage = append(usage, item)
+		}
+		b.UsageMu.Unlock()
+	}
+	rows := make([]map[string]any, 0, len(usage))
+	for _, item := range usage {
+		row := map[string]any{
+			"provider": item.Provider, "model": item.Model,
+			"input_tokens": item.InputTokens, "output_tokens": item.OutputTokens,
+			"cache_read_tokens": item.CacheReadTokens, "cache_write_tokens": item.CacheWriteTokens,
+		}
+		if item.CostUSD > 0 {
+			// Multica stores provider-reported cost in 1e-10 USD ticks.
+			row["cost_usd_ticks"] = int64(item.CostUSD * 1e10)
+		}
+		rows = append(rows, row)
+	}
+	if err := b.postLifecycle(ctx, "/api/daemon/tasks/"+taskID+"/usage", map[string]any{"usage": rows, "snapshot": snapshot}); err != nil {
+		log.Printf("multica task %s usage report failed: %v", taskID, err)
+	}
+}
+
+// reportProgress mirrors the daemon's live progress contract. Progress is
+// deliberately best effort: a transient observability failure must not turn a
+// successful Sandbox run into a failed task.
+func (b *MulticaTaskBridge) reportProgress(ctx context.Context, taskID, summary string, step, total int) {
+	if err := b.Client.Post(ctx, "/api/daemon/tasks/"+taskID+"/progress", map[string]any{
+		"summary": summary, "step": step, "total": total,
+	}, nil); err != nil {
+		log.Printf("multica task %s progress report failed: %v", taskID, err)
+	}
 }
 
 // MulticaTask is the stable subset of a daemon claim needed to launch a Sandbox.
 type MulticaTask struct {
-	ID              string `json:"id"`
-	RuntimeID       string `json:"runtime_id"`
-	IssueID         string `json:"issue_id"`
-	IssueTitle      string `json:"issue_title"`
-	IssueIdentifier string `json:"issue_identifier"`
-	Status          string `json:"status"`
-	DispatchedAt    string `json:"dispatched_at"`
-	AuthToken       string `json:"auth_token"`
-	Agent           struct {
+	ID                      string           `json:"id"`
+	RuntimeID               string           `json:"runtime_id"`
+	IssueID                 string           `json:"issue_id"`
+	ChatSessionID           string           `json:"chat_session_id,omitempty"`
+	IssueTitle              string           `json:"issue_title"`
+	IssueIdentifier         string           `json:"issue_identifier"`
+	WorkspaceContext        string           `json:"workspace_context,omitempty"`
+	ProjectTitle            string           `json:"project_title,omitempty"`
+	ProjectDescription      string           `json:"project_description,omitempty"`
+	AutopilotTitle          string           `json:"autopilot_title,omitempty"`
+	AutopilotDescription    string           `json:"autopilot_description,omitempty"`
+	QuickCreatePrompt       string           `json:"quick_create_prompt,omitempty"`
+	AutopilotTriggerPayload json.RawMessage  `json:"autopilot_trigger_payload,omitempty"`
+	PriorSessionID          string           `json:"prior_session_id,omitempty"`
+	PriorWorkDir            string           `json:"prior_work_dir,omitempty"`
+	ProjectResources        []map[string]any `json:"project_resources,omitempty"`
+	CoalescedComments       []struct {
+		ID      string `json:"id"`
+		Content string `json:"content"`
+	} `json:"coalesced_comments,omitempty"`
+	Status       string `json:"status"`
+	DispatchedAt string `json:"dispatched_at"`
+	AuthToken    string `json:"auth_token"`
+	Agent        struct {
 		Instructions  string `json:"instructions"`
 		Model         string `json:"model"`
 		ThinkingLevel string `json:"thinking_level"`
 	} `json:"agent"`
 	Repos []struct {
 		URL string `json:"url"`
+		Ref string `json:"ref,omitempty"`
 	} `json:"repos"`
 }
 
 func (t MulticaTask) ticket(defaultRepository string) Ticket {
 	repository := defaultRepository
+	revision := ""
 	if len(t.Repos) > 0 && t.Repos[0].URL != "" {
 		repository = t.Repos[0].URL
+		revision = t.Repos[0].Ref
 	}
-	prompt := fmt.Sprintf("Work on Multica issue %s: %s\n\nIssue ID: %s\n\n%s", t.IssueIdentifier, t.IssueTitle, t.IssueID, t.Agent.Instructions)
+	sections := []string{}
+	if t.IssueID != "" || t.IssueTitle != "" {
+		sections = append(sections, fmt.Sprintf("Work on Multica issue %s: %s\n\nIssue ID: %s", t.IssueIdentifier, t.IssueTitle, t.IssueID))
+	}
+	if strings.TrimSpace(t.QuickCreatePrompt) != "" {
+		sections = append(sections, t.QuickCreatePrompt)
+	}
+	if strings.TrimSpace(t.AutopilotTitle) != "" || strings.TrimSpace(t.AutopilotDescription) != "" {
+		sections = append(sections, fmt.Sprintf("Autopilot: %s\n%s", t.AutopilotTitle, t.AutopilotDescription))
+	}
+	if strings.TrimSpace(t.WorkspaceContext) != "" {
+		sections = append(sections, "Workspace context:\n"+t.WorkspaceContext)
+	}
+	sections = append(sections, t.Agent.Instructions)
+	prompt := strings.Join(sections, "\n\n")
 	return Ticket{
 		ID: t.ID, Title: t.IssueTitle, Prompt: strings.TrimSpace(prompt), AuthToken: t.AuthToken,
-		Repository: repository, Model: t.Agent.Model,
+		Repository: repository, Revision: revision, Model: t.Agent.Model,
 		Policy: ExecutionPolicy{Model: t.Agent.Model, Thinking: t.Agent.ThinkingLevel, MaxTurns: 100, TimeoutSeconds: 30 * 60, CPURequest: "500m", MemoryRequest: "512Mi", NetworkProfile: "repository-and-broker"},
 		Status: StatusRunning,
 	}
@@ -351,6 +770,20 @@ func (t MulticaTask) ticket(defaultRepository string) Ticket {
 // bridge. The configured PAT is used for runtime registration, claims, issue
 // context, and lifecycle callbacks; an optional task token is only forwarded
 // into the Sandbox environment for agent-side Multica integrations.
+type MulticaHTTPError struct {
+	Path       string
+	StatusCode int
+	Status     string
+	Body       string
+}
+
+func (e *MulticaHTTPError) Error() string {
+	if e.Body == "" {
+		return fmt.Sprintf("multica %s: status %s", e.Path, e.Status)
+	}
+	return fmt.Sprintf("multica %s: status %s: %s", e.Path, e.Status, e.Body)
+}
+
 type MulticaClient struct {
 	BaseURL     string
 	Token       string
@@ -398,7 +831,7 @@ func (c *MulticaClient) get(ctx context.Context, path, token string, out any) er
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return fmt.Errorf("multica %s: status %s", path, response.Status)
+		return &MulticaHTTPError{Path: path, StatusCode: response.StatusCode, Status: response.Status}
 	}
 	return json.NewDecoder(response.Body).Decode(out)
 }
@@ -424,7 +857,7 @@ func (c *MulticaClient) post(ctx context.Context, path, token string, body any, 
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
-		return fmt.Errorf("multica %s: status %s: %s", path, response.Status, strings.TrimSpace(string(body)))
+		return &MulticaHTTPError{Path: path, StatusCode: response.StatusCode, Status: response.Status, Body: strings.TrimSpace(string(body))}
 	}
 	if out == nil || response.ContentLength == 0 {
 		return nil

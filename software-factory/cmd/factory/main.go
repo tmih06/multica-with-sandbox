@@ -73,6 +73,7 @@ func main() {
 			bridge.AgentThinking = ""
 		}
 		bridge.AgentInstructions = *multicaAgentInstructions
+		bridge.PendingStore = store
 		go func() {
 			if err := bridge.Run(ctx); err != nil && ctx.Err() == nil {
 				log.Printf("multica bridge stopped: %v", err)

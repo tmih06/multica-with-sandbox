@@ -2,6 +2,7 @@ package factory
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -80,6 +81,12 @@ CREATE TABLE IF NOT EXISTS events (
  data TEXT NOT NULL,
  created_at TEXT NOT NULL,
  FOREIGN KEY(ticket_id) REFERENCES tickets(id)
+);
+CREATE TABLE IF NOT EXISTS pending_callbacks (
+ task_id TEXT PRIMARY KEY,
+ path TEXT NOT NULL,
+ body TEXT NOT NULL,
+ created_at TEXT NOT NULL
 );
 INSERT INTO factory_sequence(name, value)
  VALUES ('ticket', 0)
@@ -235,6 +242,48 @@ func (s *sqliteStore) EventsAfter(ticketID string, after int64) ([]Event, error)
 		events = append(events, event)
 	}
 	return events, rows.Err()
+}
+
+type pendingCallback struct {
+	TaskID string
+	Path   string
+	Body   any
+}
+
+func (s *sqliteStore) SavePendingCallback(taskID, path string, body any) error {
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`INSERT INTO pending_callbacks(task_id, path, body, created_at) VALUES (?, ?, ?, ?)
+		ON CONFLICT(task_id) DO UPDATE SET path=excluded.path, body=excluded.body`, taskID, path, string(encoded), time.Now().UTC().Format(time.RFC3339Nano))
+	return err
+}
+
+func (s *sqliteStore) DeletePendingCallback(taskID string) error {
+	_, err := s.db.Exec("DELETE FROM pending_callbacks WHERE task_id = ?", taskID)
+	return err
+}
+
+func (s *sqliteStore) PendingCallbacks() ([]pendingCallback, error) {
+	rows, err := s.db.Query("SELECT task_id, path, body FROM pending_callbacks ORDER BY created_at")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []pendingCallback
+	for rows.Next() {
+		var item pendingCallback
+		var raw string
+		if err := rows.Scan(&item.TaskID, &item.Path, &raw); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal([]byte(raw), &item.Body); err != nil {
+			return nil, err
+		}
+		result = append(result, item)
+	}
+	return result, rows.Err()
 }
 
 func (s *sqliteStore) Close() error { return s.db.Close() }

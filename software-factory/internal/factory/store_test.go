@@ -40,6 +40,37 @@ func TestSQLiteStorePersistsTicketAcrossReopen(t *testing.T) {
 	}
 }
 
+func TestSQLiteStorePersistsPendingLifecycleCallback(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "factory.db")
+	store, err := OpenSQLiteStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := map[string]any{"error": "timeout", "failure_reason": "timeout"}
+	if err := store.SavePendingCallback("task-1", "/api/daemon/tasks/task-1/fail", body); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = OpenSQLiteStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	pending, err := store.PendingCallbacks()
+	if err != nil || len(pending) != 1 || pending[0].TaskID != "task-1" || pending[0].Path == "" {
+		t.Fatalf("pending = %#v, err = %v", pending, err)
+	}
+	if err := store.DeletePendingCallback("task-1"); err != nil {
+		t.Fatal(err)
+	}
+	pending, err = store.PendingCallbacks()
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("pending after delete = %#v, err = %v", pending, err)
+	}
+}
+
 func TestSQLiteStoreListsActiveTicketsForRecovery(t *testing.T) {
 	store, err := OpenSQLiteStore(filepath.Join(t.TempDir(), "factory.db"))
 	if err != nil {

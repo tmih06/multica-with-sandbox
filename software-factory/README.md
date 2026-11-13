@@ -37,7 +37,7 @@ kubectl config use-context kind-factory
 KUBECTL=/tmp/factory-tools/kubectl go run ./cmd/factory -namespace factory-test
 ```
 
-The default image is `ghcr.io/tmih06/ompig-slim-workspace:v0.1.5`. Override it with `-image` or `FACTORY_IMAGE`.
+The default image is `ghcr.io/tmih06/ompig-slim-workspace:v0.1.5`. Override it with `-image` or `FACTORY_IMAGE`. From the Multica repository, `make factory-image` builds the current event-capable image as `ompig-slim-workspace:dev`; set `FACTORY_IMAGE=ompig-slim-workspace:dev` when running the factory against a cluster that can access that image. New workspace images that support `ompig-slim durable --events-file` stream structured transcript events while a run is active and `--control-file` accept live steering; older images remain compatible through capability detection but provide only the final receipt and do not accept steering.
 
 To run the factory as a Sandbox-backed Multica runtime, provide a Multica PAT
 with access to the target workspace. The factory registers one runtime, claims
@@ -113,7 +113,7 @@ A ticket ends as `finished` or `failed`. `finished` means the worker Pod complet
 
 The events endpoint replays persisted lifecycle events and then streams new events. Send `Last-Event-ID` to resume after a disconnect.
 
-The logs endpoint returns the factory lifecycle markers and captured Pod stdout/stderr. It is the audit trail for the MVP; the exact internal Durable tool-event stream is not exposed yet. Ticket state is persisted in SQLite and active runs are reconciled on startup.
+The logs endpoint returns the factory lifecycle markers and captured Pod stdout/stderr. Structured worker transcript events are forwarded to Multica when the workspace image supports the events-file protocol; the final receipt remains the fallback audit path. New issue comments and chat user messages are polled during active runs and forwarded through the worker control-file protocol when supported. Ticket state is persisted in SQLite and active runs are reconciled on startup.
 
 `POST /tickets` requires `title` and `prompt`. Optional fields are `repository`, `model`, and `policy`. Policy supports `thinking`, `max_turns`, `timeout_seconds`, `cpu_request`, `memory_request`, and `network_profile`. The effective policy is persisted with the ticket. `model` must use `provider/model` format when supplied.
 

@@ -161,7 +161,8 @@ as the product surface while running agent work in isolated Kubernetes Agent
 Sandboxes. The factory remains a separate Go module so it can evolve as a new
 execution backend without coupling its worker lifecycle to the existing server.
 
-Run its focused tests with `make factory-test`, or start it with `make factory-run`.
+Run its focused tests with `make factory-test`, build the event-capable worker
+image with `make factory-image`, or start it with `make factory-run`.
 See [`software-factory/README.md`](software-factory/README.md) for Kubernetes,
 Multica bridge, and local integration setup.
 
