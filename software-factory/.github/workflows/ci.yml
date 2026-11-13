@@ -1,0 +1,151 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOFLAGS: -mod=readonly
+
+jobs:
+  format:
+    name: gofmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Check formatting
+        run: test -z "$(gofmt -l cmd internal)"
+
+  test:
+    name: unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Run tests
+        run: go test -count=1 ./...
+
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Generate coverage profile
+        run: go test -count=1 -covermode=atomic -coverprofile=coverage.out ./internal/factory
+      - name: Report coverage
+        run: go tool cover -func=coverage.out
+      - name: Upload coverage profile
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-coverage
+          path: coverage.out
+          if-no-files-found: error
+          retention-days: 14
+
+  race:
+    name: race detector
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Run race tests
+        run: go test -race -count=1 ./...
+
+  vet:
+    name: go vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Run vet
+        run: go vet ./...
+
+  build:
+    name: build (${{ matrix.goos }}/${{ matrix.goarch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build factory
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: go build -trimpath -ldflags='-s -w' -o "dist/factory-${{ matrix.goos }}-${{ matrix.goarch }}" ./cmd/factory
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: factory-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/factory-${{ matrix.goos }}-${{ matrix.goarch }}
+          if-no-files-found: error
+          retention-days: 14
+
+  integration:
+    name: phase 1-6 integration tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Test durable persistence
+        run: go test -count=1 ./internal/factory -run 'TestSQLiteStorePersists|TestSQLiteStoreListsActive'
+      - name: Test SSE replay and streaming
+        run: go test -count=1 ./internal/factory -run 'TestSQLiteStorePersistsEvents|TestTicketEventsEndpoint'
+      - name: Test restart recovery
+        run: go test -count=1 ./internal/factory -run 'TestReconcile'
+      - name: Test policy persistence and application
+        run: go test -count=1 ./internal/factory -run 'TestTicketStoresEffectiveExecutionPolicy|TestSandboxTimeoutUsesTicketPolicy'
+      - name: Test two-worker concurrency
+        run: go test -count=1 ./internal/factory -run 'TestServerRunsTwoTicketsConcurrentlyAtCapacityTwo'
+
+  vulnerability:
+    name: vulnerability scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+      - name: Scan dependencies and packages
+        run: "$(go env GOPATH)/bin/govulncheck ./..."

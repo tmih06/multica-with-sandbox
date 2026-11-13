@@ -1,4 +1,4 @@
-.PHONY: help makehelp dev server daemon cli multica build test migrate-up migrate-down sqlc seed clean setup start stop check worktree-env setup-main start-main stop-main check-main setup-worktree start-worktree stop-worktree check-worktree remove-worktree db-up db-down db-drop db-reset selfhost selfhost-build selfhost-stop up down status list destroy gc env-exec api-dev web-dev desktop-dev
+.PHONY: help makehelp dev server daemon cli multica factory-test factory-run build test migrate-up migrate-down sqlc seed clean setup start stop check worktree-env setup-main start-main stop-main check-main setup-worktree start-worktree stop-worktree check-worktree remove-worktree db-up db-down db-drop db-reset selfhost selfhost-build selfhost-stop up down status list destroy gc env-exec api-dev web-dev desktop-dev
 
 MAIN_ENV_FILE ?= .env
 WORKTREE_ENV_FILE ?= .env.worktree
@@ -183,6 +183,12 @@ env-exec: ## Run a command with this environment's variables (ARGS="-- pnpm dev:
 # environment reports "unknown" and cannot prove which revision it is serving.
 api-dev: ## Run only the Go backend for the current env file
 	cd server && go run -ldflags "-X main.commit=$(COMMIT)" ./cmd/server
+
+factory-run: ## Run the in-repo Kubernetes Sandbox backend
+	cd software-factory && go run ./cmd/factory
+
+factory-test: ## Run tests for the in-repo Kubernetes Sandbox backend
+	cd software-factory && go test ./...
 
 web-dev: ## Run only the Next.js dev server for the current env file
 	pnpm dev:web

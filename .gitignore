@@ -46,6 +46,8 @@ server/tmp/
 server/migrate
 server/daemon
 server/multica
+software-factory/factory.db
+software-factory/bin/
 
 # Test artifacts
 test-results/

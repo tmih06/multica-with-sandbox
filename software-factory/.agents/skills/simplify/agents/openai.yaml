@@ -1,0 +1,5 @@
+interface:
+  display_name: "Simplify"
+  short_description: "Remove complexity from finished work, behavior unchanged"
+policy:
+  allow_implicit_invocation: false

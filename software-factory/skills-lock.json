@@ -1,0 +1,65 @@
+{
+  "version": 2,
+  "skills": {
+    "antislop": {
+      "source": "miqdadbadjuber/anti-slop",
+      "sourceType": "github",
+      "skillPath": "skills/antislop/SKILL.md",
+      "computedHash": "d385740b7f582612b4ebe31e936ecc18fed34eaa81ed2c1a638e783a7109ce4a"
+    },
+    "antislop-code": {
+      "source": "miqdadbadjuber/anti-slop",
+      "sourceType": "github",
+      "skillPath": "skills/antislop-code/SKILL.md",
+      "computedHash": "4a2d3d64037896a3ab4e2c3df026e7a59fa92458617c65a2e0ed7fc3c456266a"
+    },
+    "codebase-design": {
+      "source": "tmih06/skills",
+      "sourceType": "github",
+      "skillPath": "skills/codebase-design/SKILL.md",
+      "computedHash": "f499866e387e7f7d12a5c3226aab324347d133eeb837abb38583cbbfe0ec7886"
+    },
+    "handoff": {
+      "source": "tmih06/skills",
+      "sourceType": "github",
+      "skillPath": "skills/handoff/SKILL.md",
+      "computedHash": "684aaf10031543853b73f263d23bbccc85eb4fddf5d5b20a7b09beb4e478e8f5"
+    },
+    "optimize": {
+      "source": "tmih06/skills",
+      "sourceType": "github",
+      "skillPath": "skills/optimize/SKILL.md",
+      "computedHash": "59880ab4b05450ca779b9b29f4e30a36f87affc2b030de89a87ecec7b640fc38"
+    },
+    "pr": {
+      "source": "tmih06/skills",
+      "sourceType": "github",
+      "skillPath": "skills/pr/SKILL.md",
+      "computedHash": "34c7d82062f8bc9c8811f55cd9825f2365419a731f5d3b73d41b193bc9b88293"
+    },
+    "research": {
+      "source": "tmih06/skills",
+      "sourceType": "github",
+      "skillPath": "skills/research/SKILL.md",
+      "computedHash": "5bd6a6b833227dd87ee023c2d4734f4c349f290140514bb80bdc041ead1e837e"
+    },
+    "simplify": {
+      "source": "tmih06/skills",
+      "sourceType": "github",
+      "skillPath": "skills/simplify/SKILL.md",
+      "computedHash": "4724fff9ff22c6d74d21ae5a259ba586c86c09552582e42c71ebdff1a3e7bfd5"
+    },
+    "tdd": {
+      "source": "tmih06/skills",
+      "sourceType": "github",
+      "skillPath": "skills/tdd/SKILL.md",
+      "computedHash": "cfae830bf50400adfab361a4e0570cff3884ed1fffea76a2fe873335eec855ed"
+    },
+    "to-tickets": {
+      "source": "tmih06/skills",
+      "sourceType": "github",
+      "skillPath": "skills/to-tickets/SKILL.md",
+      "computedHash": "e59ae54f6eca1eccdd5f64a7b435ebae82241c9c1e102b3d33fb6c6c9b743b77"
+    }
+  }
+}

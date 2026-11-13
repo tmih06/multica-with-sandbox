@@ -153,6 +153,18 @@ turn it off — [what's collected](SELF_HOSTING.md#anonymous-deployment-telemetr
 
 </details>
 
+### In-repo Sandbox backend
+
+This checkout also contains the experimental Go software-factory backend in
+[`software-factory/`](software-factory/). It uses the Multica frontend and API
+as the product surface while running agent work in isolated Kubernetes Agent
+Sandboxes. The factory remains a separate Go module so it can evolve as a new
+execution backend without coupling its worker lifecycle to the existing server.
+
+Run its focused tests with `make factory-test`, or start it with `make factory-run`.
+See [`software-factory/README.md`](software-factory/README.md) for Kubernetes,
+Multica bridge, and local integration setup.
+
 ### Your first agent in five minutes
 
 **1. Connect a computer.** A *runtime* is any machine agents can work on — your laptop, or a
